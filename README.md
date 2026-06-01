@@ -2,7 +2,7 @@
 
 An LLM agent that automatically turns raw potentiostat csv's into detailed reports.
 
-Takes a folder of CHI Instruments csv files, parses them, decides which analyses to run given the test(Randles-Ševčík, C_dl, Laviron), does the math, writes a clean report of the results, and flags unusual results. 
+Takes a folder of CHI Instruments csv files, parses them, decides which analyses to run given the test (Randles-Ševčík, C_dl, Laviron), does the math, writes a clean report of the results, and flags unusual results. 
 
 Built for wearable biosensor electrode cyclic voltammetry characterization following the Ye et al. (2024) protocol.
 
