@@ -60,7 +60,7 @@ def main() -> int:
         print(f"  {el.value:14s} {n} files")
     print()
 
-    print("by electrode, with the scan rates we saw for each")
+    print("by electrode, with the scan rates seen for each")
     for eid in sorted(by_electrode):
         rates = sorted({e.file_meta.scan_rate_mv_s for e in by_electrode[eid]})
         print(f"  {eid}: {len(by_electrode[eid])} files at {rates} mV/s")
@@ -83,7 +83,7 @@ def main() -> int:
     # finally print out one full experiment so we can eyeball that the fields
     # actually got filled in right
     print()
-    print("here's the first file in full, just to eyeball it")
+    print("full first file")
     sample = successes[0]
     print(f"  file:        {sample.file_meta.source_path.name}")
     print(f"  electrode:   {sample.file_meta.electrode_id}")

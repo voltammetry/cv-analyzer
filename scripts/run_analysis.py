@@ -1,19 +1,17 @@
-"""the main entry point. parses every cv file, runs the agent, writes reports.
-
-this is what you run when you want results. flow is
+"""parses every cv file, runs the agent, writes reports.
 
   1. parse every cv file in data/raw
   2. group files by electrode
   3. for each electrode
        a. ask the agent which analyses to run (decide)
-       b. actually run them
+       b. run them
        c. ask the agent to write a short interpretation (interpret)
        d. plot everything and write an html report
   4. write a summary csv across all electrodes
   5. write an index.html linking to every electrode's report
 
-the agent uses claude if ANTHROPIC_API_KEY is set in the environment. without
-the key it falls back to deterministic rules so the script still works.
+uses claude if ANTHROPIC_API_KEY is set in the environment. 
+without the key it falls back to deterministic rules so the script still works.
 """
 
 from __future__ import annotations
