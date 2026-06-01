@@ -26,7 +26,7 @@ pip install -e ".[dev,analysis,agent]"
 
 drop `.csv` files in `data/raw/`.
 
-## How to un
+## How to run
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
