@@ -71,6 +71,23 @@ class AgentComparison:
 # the deterministic fallback. used when no api key is set.
 # -----------------------------------------------------------------------------
 
+def _mean_peak_separation_mv(experiments: list[CVExperiment]) -> float | None:
+    """mean (Ep,a - Ep,c) across scan rates, second cycle, in mV. None if unknown."""
+    seps = []
+    for e in experiments:
+        epa = epc = None
+        for seg in e.segment_results:
+            if seg.ep_v is None or seg.ip_a is None:
+                continue
+            if seg.ip_a > 0:
+                epa = seg.ep_v
+            elif seg.ip_a < 0:
+                epc = seg.ep_v
+        if epa is not None and epc is not None:
+            seps.append((epa - epc) * 1000.0)
+    if not seps:
+        return None
+    return sum(seps) / len(seps)
 
 def _deterministic_decide(experiments: list[CVExperiment]) -> AgentDecision:
     """the simple rule based version of decide(). used as a backup.
@@ -87,8 +104,17 @@ def _deterministic_decide(experiments: list[CVExperiment]) -> AgentDecision:
     reasons: list[str] = []
     if Electrolyte.FERRO_FERRI in electrolytes:
         analyses.add("randles_sevcik")
-        analyses.add("laviron")
-        reasons.append("ferro/ferri data is here, so randles sevcik for EASA and laviron for k0")
+        ff = [e for e in experiments if e.file_meta.electrolyte == Electrolyte.FERRO_FERRI]
+        sep_mv = _mean_peak_separation_mv(ff)
+        if sep_mv is not None and sep_mv > 212:
+            analyses.add("laviron")
+            reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV > 212, so randles sevcik + laviron")
+        elif sep_mv is not None and sep_mv >= 61:
+            analyses.add("nicholson")
+            reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV in 61-212, so randles sevcik + nicholson")
+        else:
+            analyses.add("laviron")
+            reasons.append("ferro/ferri; ΔEp unknown, defaulting to randles sevcik + laviron")
     if Electrolyte.PBS in electrolytes:
         analyses.add("cdl")
         reasons.append("pbs data is here, so cdl for double layer capacitance")
@@ -159,7 +185,7 @@ def _deterministic_interpret(
 
 
 # what the model is allowed to pick from
-_ALLOWED_ANALYSES = {"randles_sevcik", "cdl", "laviron"}
+_ALLOWED_ANALYSES = {"randles_sevcik", "cdl", "laviron", "nicholson"}
 
 
 def _build_decide_prompt(experiments: list[CVExperiment]) -> str:
