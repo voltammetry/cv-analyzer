@@ -31,9 +31,11 @@ from cv_agent.agent import compare, decide, interpret
 from cv_agent.analysis import (
     CdlResult,
     LavironResult,
+    NicholsonResult,
     RandlesSevcikResult,
     cdl,
     laviron,
+    nicholson,
     randles_sevcik,
 )
 from cv_agent.models import CVExperiment, Electrolyte
@@ -41,6 +43,7 @@ from cv_agent.report import (
     plot_cdl,
     plot_cv_overlay,
     plot_laviron,
+    plot_nicholson,
     plot_randles_sevcik,
     write_electrode_report,
 )
@@ -98,6 +101,12 @@ def process_electrode(electrode_id: str, experiments: list[CVExperiment],
     if "laviron" in decision.analyses_to_run and ferri:
         lav_res = laviron(ferri)
         lav_plot_path = plot_laviron(lav_res, out_dir / f"{electrode_id}_laviron.png")
+        
+    nic_res: NicholsonResult | None = None
+    nic_plot_path: Path | None = None
+    if "nicholson" in decision.analyses_to_run and ferri:
+        nic_res = nicholson(ferri)
+        nic_plot_path = plot_nicholson(nic_res, out_dir / f"{electrode_id}_nicholson.png")
 
     # step 3, agent writes an interpretation
     # pull size from the first file (all files for one electrode share a size)
@@ -111,6 +120,7 @@ def process_electrode(electrode_id: str, experiments: list[CVExperiment],
         rs=rs_res, rs_plot=rs_plot_path,
         cdl_res=cdl_res, cdl_plot=cdl_plot_path,
         lav=lav_res, lav_plot=lav_plot_path,
+        nic=nic_res, nic_plot=nic_plot_path,
         out_path=out_dir / f"{electrode_id}_report.html",
     )
 

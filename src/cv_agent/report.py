@@ -17,7 +17,7 @@ matplotlib.use("Agg")  # non interactive backend, safe to use in scripts
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .analysis import CdlResult, LavironResult, RandlesSevcikResult
+from .analysis import CdlResult, LavironResult, NicholsonResult, RandlesSevcikResult
 from .models import CVExperiment
 
 
@@ -130,6 +130,28 @@ def plot_laviron(result: LavironResult, out_path: Path) -> Path:
     plt.close(fig)
     return out_path
 
+def plot_nicholson(result: NicholsonResult, out_path: Path) -> Path:
+    """ks at each scan rate plus the average. the diagnostic plot for Nicholson."""
+    fig, ax = plt.subplots(figsize=(6, 4.5))
+    nu = result.scan_rates_v_s
+    if np.all(np.isnan(result.ks_per_scan_cm_s)):
+        ax.text(0.5, 0.5, "ks not computed\n(ΔEp outside 61-212 mV)",
+                ha="center", va="center", transform=ax.transAxes)
+    else:
+        ax.scatter(nu, result.ks_per_scan_cm_s, color="C5", zorder=3,
+                   label="ks per scan rate")
+        if result.ks_mean_cm_s is not None:
+            ax.axhline(result.ks_mean_cm_s, color="C5", lw=1.0, ls="--",
+                       label=f"mean ks = {result.ks_mean_cm_s:.2e} cm/s")
+    ax.set_xlabel(r"Scan rate $\nu$ / (V/s)")
+    ax.set_ylabel(r"$k^0$ / cm s$^{-1}$")
+    ax.set_title(f"Nicholson: {result.electrode_id}")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return out_path
 
 # -----------------------------------------------------------------------------
 # the html report. simple template with inline css so the file is self contained.
@@ -246,6 +268,24 @@ linear with log(ν) and yield the transfer coefficient α and k⁰.</p>
 <div class="note"><b>Caveat:</b> {lav.notes}</div>
 """
 
+def _nicholson_section_html(nic: NicholsonResult, nic_plot: Path) -> str:
+    if nic.ks_mean_cm_s is None:
+        ks_str = "(not computed)"
+    else:
+        ks_str = f"{nic.ks_mean_cm_s:.3e} ± {nic.ks_std_cm_s:.1e} cm/s"
+    rows = "".join(
+        f"<tr><td>{nu*1000:g}</td><td>{dep*1000:.1f}</td><td>{ps:.3f}</td></tr>"
+        for nu, dep, ps in zip(nic.scan_rates_v_s, nic.delta_ep_v, nic.psi)
+    )
+    return f"""
+<h2>4 · Nicholson (Electron Transfer Kinetics)</h2>
+<p>For peak separation in the 61-212 mV range, k⁰ is found per scan rate from
+<em>k⁰ = Ψ · √(nπDFν / RT)</em>, Ψ from Nicholson's working curve.</p>
+<img src="{nic_plot.name}" alt="Nicholson plot">
+<p><b>mean k⁰</b> = {ks_str}</p>
+<table><tr><th>ν / mV·s⁻¹</th><th>ΔEp / mV</th><th>Ψ</th></tr>{rows}</table>
+<div class="note">{nic.notes}</div>
+"""
 
 def write_electrode_report(
     electrode_id: str,
@@ -256,6 +296,8 @@ def write_electrode_report(
     cdl_plot: Path | None,
     lav: LavironResult | None,
     lav_plot: Path | None,
+    nic: NicholsonResult | None,
+    nic_plot: Path | None,
     out_path: Path,
 ) -> Path:
     """stitch the plots and analysis results into one html page for one electrode."""
@@ -271,6 +313,8 @@ def write_electrode_report(
         sections.append(_cdl_section_html(cdl_res, cdl_plot))
     if lav is not None and lav_plot is not None:
         sections.append(_laviron_section_html(lav, lav_plot))
+    if nic is not None and nic_plot is not None:
+        sections.append(_nicholson_section_html(nic, nic_plot))
 
     html = _HTML_TEMPLATE.format(
         electrode_id=electrode_id,
