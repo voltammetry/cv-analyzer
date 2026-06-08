@@ -118,6 +118,16 @@ class LavironResult:
     k0_per_s: float | None                # the rate constant we're after, s^-1
     notes: str                            # explains caveats and when k0 is None
 
+@dataclass(frozen=True)
+class NicholsonResult:
+    electrode_id: str
+    scan_rates_v_s: np.ndarray
+    delta_ep_v: np.ndarray               # peak separation per scan rate
+    psi: np.ndarray                      # Ψ looked up per scan rate
+    ks_per_scan_cm_s: np.ndarray         # ks for each scan rate, cm/s
+    ks_mean_cm_s: float | None
+    ks_std_cm_s: float | None
+    notes: str
 
 # -----------------------------------------------------------------------------
 # small helpers that the analyses share
@@ -535,4 +545,98 @@ def laviron(experiments: list[CVExperiment]) -> LavironResult:
         alpha=alpha,
         k0_per_s=float(k0),
         notes=" ".join(notes_parts),
+    )
+
+# -----------------------------------------------------------------------------
+# analysis 4, nicholson, electron transfer kinetics for 61-212 mV peak sep
+# -----------------------------------------------------------------------------
+
+# Ψ vs ΔEp in mV (n=1, 25 °C), transcribed from protocol Table 4 (page 28).
+# np.interp fills the small gaps between tabulated points (e.g. 91-99).
+_NICHOLSON_PSI_MV = {
+    61: 9.5, 62: 6.5, 63: 5.3, 64: 4.4, 65: 3.7, 66: 3.3, 67: 2.9, 68: 2.6,
+    69: 2.35, 70: 2.15, 71: 1.95, 72: 1.83, 73: 1.69, 74: 1.58, 75: 1.48,
+    76: 1.40, 77: 1.32, 78: 1.25, 79: 1.19, 80: 1.13, 81: 1.08, 82: 1.028,
+    83: 0.984, 84: 0.943, 85: 0.906, 86: 0.871, 87: 0.839, 88: 0.809,
+    89: 0.781, 90: 0.755,
+    100: 0.558, 101: 0.544, 102: 0.530, 103: 0.517, 104: 0.504, 105: 0.492,
+    106: 0.480, 107: 0.469, 108: 0.458, 109: 0.448, 110: 0.438, 111: 0.428,
+    112: 0.419, 113: 0.410, 114: 0.402, 115: 0.394, 116: 0.386, 117: 0.378,
+    118: 0.370, 119: 0.363, 120: 0.356, 121: 0.349, 122: 0.343, 123: 0.337,
+    124: 0.331, 125: 0.325, 126: 0.319, 127: 0.313, 128: 0.308, 129: 0.302,
+}
+
+NICHOLSON_MIN_MV = 61.0
+NICHOLSON_MAX_MV = 212.0
+
+
+def _psi_from_dep(delta_ep_mv: float) -> float:
+    xs = sorted(_NICHOLSON_PSI_MV)
+    ys = [_NICHOLSON_PSI_MV[x] for x in xs]
+    return float(np.interp(delta_ep_mv, xs, ys))
+
+
+def nicholson(experiments: list[CVExperiment]) -> NicholsonResult:
+    """heterogeneous rate constant ks via Nicholson's working curve.
+
+    protocol steps 26-37. valid when the mean peak separation is 61-212 mV.
+    ks comes out in cm/s (note: that's a different unit from laviron's k0).
+    """
+    if not experiments:
+        raise ValueError("nicholson, got an empty experiment list")
+
+    electrode_ids = {e.file_meta.electrode_id for e in experiments}
+    if len(electrode_ids) != 1:
+        raise ValueError(f"nicholson, all experiments must be one electrode. got {electrode_ids}")
+    electrode_id = electrode_ids.pop()
+
+    for e in experiments:
+        if e.file_meta.electrolyte != Electrolyte.FERRO_FERRI:
+            raise ValueError("nicholson needs ferro/ferri data")
+
+    experiments = sorted(experiments, key=lambda e: e.scan_rate_v_s)
+    nus = np.array([e.scan_rate_v_s for e in experiments])
+
+    # second-cycle peak potentials (last anodic / last cathodic segment wins)
+    Ep_a = np.full(len(experiments), np.nan)
+    Ep_c = np.full(len(experiments), np.nan)
+    for i, e in enumerate(experiments):
+        for seg in e.segment_results:
+            if seg.ep_v is None or seg.ip_a is None:
+                continue
+            if seg.ip_a > 0:
+                Ep_a[i] = seg.ep_v
+            elif seg.ip_a < 0:
+                Ep_c[i] = seg.ep_v
+
+    delta_ep = Ep_a - Ep_c
+    mean_dep_mv = float(np.nanmean(delta_ep)) * 1000.0
+
+    if not (NICHOLSON_MIN_MV <= mean_dep_mv <= NICHOLSON_MAX_MV):
+        return NicholsonResult(
+            electrode_id=electrode_id,
+            scan_rates_v_s=nus,
+            delta_ep_v=delta_ep,
+            psi=np.full(len(nus), np.nan),
+            ks_per_scan_cm_s=np.full(len(nus), np.nan),
+            ks_mean_cm_s=None,
+            ks_std_cm_s=None,
+            notes=(f"mean ΔEp = {mean_dep_mv:.0f} mV is outside Nicholson's "
+                   f"61-212 mV range; use Laviron instead. ks not computed."),
+        )
+
+    psi = np.array([_psi_from_dep(d * 1000.0) for d in delta_ep])
+    ks = psi * np.sqrt(
+        N_ELECTRONS * math.pi * D_FERROFERRI * F_CONST * nus / (R_CONST * T_KELVIN)
+    )
+    return NicholsonResult(
+        electrode_id=electrode_id,
+        scan_rates_v_s=nus,
+        delta_ep_v=delta_ep,
+        psi=psi,
+        ks_per_scan_cm_s=ks,
+        ks_mean_cm_s=float(np.nanmean(ks)),
+        ks_std_cm_s=float(np.nanstd(ks, ddof=1)),
+        notes=(f"ks per protocol step 35, averaged over {len(ks)} scan rates. "
+               f"mean ΔEp = {mean_dep_mv:.0f} mV. ks in cm/s."),
     )
