@@ -50,7 +50,8 @@ N_ELECTRONS = 1
 # diffusion coefficient for Fe(CN)6 3-/4- in 0.1 M KCl at 25 C. literature
 # values are usually somewhere between 6.5e-6 and 8e-6 cm^2/s, we picked 7.6e-6
 # as a reasonable middle.
-D_FERROFERRI = 7.6e-6  # cm^2/s
+D_FERROFERRI = 7.2e-6  # cm^2/s, Konopka & McDuffe 1970
+
 
 # 5 mM concentration converted to mol/cm^3 (5 mmol/L * 1 L / 1000 cm^3)
 C_FERROFERRI_MOL_PER_CM3 = 5e-3 * 1e-3
