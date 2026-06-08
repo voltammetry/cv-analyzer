@@ -170,20 +170,13 @@ def _find_peaks_from_experiment(exp: CVExperiment) -> tuple[float | None, float 
     # block, so we use those first. if it didn't find peaks for some reason
     # we fall back to scanning the raw data ourselves.
 
-    # gather the machine's own picks by segment. positive ip means anodic.
-    instrument_ip_a: list[float] = []
-    instrument_ip_c: list[float] = []
-    for seg in exp.segment_results:
-        if seg.ip_a is None:
-            continue
-        if seg.ip_a > 0:
-            instrument_ip_a.append(seg.ip_a)
-        else:
-            instrument_ip_c.append(seg.ip_a)
+    anodic = [s.ip_a for s in exp.segment_results if s.ip_a is not None and s.ip_a > 0]
+    cathodic = [s.ip_a for s in exp.segment_results if s.ip_a is not None and s.ip_a < 0]
 
-    if instrument_ip_a and instrument_ip_c:
-        # take the biggest anodic and most negative cathodic across all cycles
-        return max(instrument_ip_a), min(instrument_ip_c)
+    if anodic and cathodic:
+        # protocol: use the second cycle. chi writes segments in order, so the
+        # last anodic and last cathodic segments are the second cycle's peaks.
+        return anodic[-1], cathodic[-1]
 
     # backup, scan the raw data. just take the global max and min current
     # across all segments.
@@ -436,9 +429,9 @@ def laviron(experiments: list[CVExperiment]) -> LavironResult:
         for seg in e.segment_results:
             if seg.ep_v is None or seg.ip_a is None:
                 continue
-            if seg.ip_a > 0 and np.isnan(Ep_a[i]):
-                Ep_a[i] = seg.ep_v
-            elif seg.ip_a < 0 and np.isnan(Ep_c[i]):
+            if seg.ip_a > 0:
+                Ep_a[i] = seg.ep_v      # keep overwriting to keep 2nd cycle only
+            elif seg.ip_a < 0:
                 Ep_c[i] = seg.ep_v
 
     # need at least three valid peak pairs to even attempt a fit
