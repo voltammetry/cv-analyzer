@@ -35,7 +35,7 @@ python scripts/run_analysis.py
 
 Reports go to `output/`. `output/index.html` opens in a browser.
 
-If no API key, reports will function without LLM analysis.
+If no API key, reports will still function, just without LLM analysis.
 
 ---
 
