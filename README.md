@@ -20,7 +20,7 @@ Characterizing a fabricated electrode means running the same analysis pipeline a
 git clone https://github.com/<you>/cv-agent.git
 cd cv-agent
 python -m venv .venv
-source .venv/bin/activate      # windows: .venv\Scripts\Activate.ps1
+source .venv/bin/activate      # <-- macos. windows: .venv\Scripts\Activate.ps1
 pip install -e ".[dev,analysis,agent]"
 ```
 
