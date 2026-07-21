@@ -47,7 +47,17 @@ class FileMetadata:
     electrolyte: Electrolyte
     source_path: Path
     electrode_size_mm: int       # diameter in mm, from the sp prefix (sp1 = 1mm, etc)
+    replicate_group: str | None = None   # which replicate set this electrode belongs
+                                         # to (e.g. "ab"). None means "use the default
+                                         # grouping", which strips the trailing digits
+                                         # off the electrode id.
 
+
+def default_replicate_group(electrode_id: str) -> str:
+    """just a way to group electrodes"""
+    import re
+    m = re.match(r"^([a-z]+)", electrode_id.lower())
+    return m.group(1) if m else electrode_id
 
 @dataclass(frozen=True)
 class InstrumentMetadata:
