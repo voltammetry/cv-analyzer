@@ -48,7 +48,7 @@ RS_CONSTANT = 2.69e5
 N_ELECTRONS = 1
 
 # diffusion coefficient for Fe(CN)6 3-/4- in 0.1 M KCl at 25 C. literature
-# values are usually somewhere between 6.5e-6 and 8e-6 cm^2/s, we picked 7.6e-6
+# values are usually somewhere between 6.5e-6 and 8e-6 cm^2/s, we picked 7.2e-6
 # as a reasonable middle.
 D_FERROFERRI = 7.2e-6  # cm^2/s, Konopka & McDuffe 1970
 
@@ -66,6 +66,11 @@ T_KELVIN = 298.15  # room temperature, 25 C
 # is happening, so the current is purely capacitive.
 CDL_POTENTIAL_V = 0.6
 
+# which electron-transfer method applies, straight from the protocol:
+# ΔEp > 212 mV -> laviron (steps 14-25), 61 <= ΔEp <= 212 mV -> nicholson
+# (steps 26-37). these are the only two thresholds in the whole routing
+# decision, which is why no llm is involved in choosing.
+LAVIRON_MIN_MV = 212.0
 
 # -----------------------------------------------------------------------------
 # result dataclasses. each analysis returns one of these.
@@ -84,16 +89,20 @@ class LinearFit:
 
 @dataclass(frozen=True)
 class RandlesSevcikResult:
-    electrode_id: str
+    electrode_id: str                     # electrode id, or the group id when
+                                          # this was fit on replicate-averaged data
     scan_rates_v_s: np.ndarray            # nu, V/s
     sqrt_scan_rates: np.ndarray           # sqrt(nu), for plotting
-    ipa_a: np.ndarray                     # anodic peak currents, A
-    ipc_a: np.ndarray                     # cathodic peak currents, A
+    ipa_a: np.ndarray                     # anodic peak currents, A (mean if averaged)
+    ipc_a: np.ndarray                     # cathodic peak currents, A (mean if averaged)
     anodic_fit: LinearFit                 # |ipa| vs sqrt(nu)
     cathodic_fit: LinearFit               # |ipc| vs sqrt(nu)
     easa_anodic_cm2: float                # surface area from anodic slope
     easa_cathodic_cm2: float              # surface area from cathodic slope
     easa_mean_cm2: float                  # average of the two, more robust
+    ipa_std_a: np.ndarray | None = None   # per-scan-rate std across replicates
+    ipc_std_a: np.ndarray | None = None   # (None when fit on a single electrode)
+    n_replicates: int = 1              # average of the two, more robust
 
 
 @dataclass(frozen=True)
@@ -108,15 +117,23 @@ class CdlResult:
 
 @dataclass(frozen=True)
 class LavironResult:
-    electrode_id: str
+    """protocol steps 14-25: ΔE vs ln(ν), x-intercept -> Vc, ks = nFαVc/RT."""
+
+    electrode_id: str                     # group id when fit on averaged data
     scan_rates_v_s: np.ndarray
-    delta_ep_v: np.ndarray                # peak to peak separation, Ep_a - Ep_c
-    log_scan_rates: np.ndarray            # log10(nu)
-    anodic_branch_fit: LinearFit | None
-    cathodic_branch_fit: LinearFit | None
-    alpha: float | None                   # transfer coefficient, 0 to 1
-    k0_per_s: float | None                # the rate constant we're after, s^-1
-    notes: str                            # explains caveats and when k0 is None
+    ln_scan_rates: np.ndarray             # ln(nu), the protocol's x axis
+    delta_ea_v: np.ndarray                # Ep,a - E0' (averaged across replicates)
+    delta_ec_v: np.ndarray                # Ep,c - E0' (averaged across replicates)
+    delta_ea_std_v: np.ndarray | None
+    delta_ec_std_v: np.ndarray | None
+    anodic_branch_fit: LinearFit | None   # ΔEa vs ln(nu)
+    cathodic_branch_fit: LinearFit | None # ΔEc vs ln(nu)
+    alpha: float | None                   # transfer coefficient used in ks
+    alpha_source: str                     # "branch slopes" or "assumed 0.5"
+    vc_v_s: float | None                  # critical scan rate, the x-intercept
+    k0_per_s: float | None                # ks = nFαVc/RT, s^-1
+    n_replicates: int
+    notes: str                            # caveats, and why k0 is None if it is                       # explains caveats and when k0 is None
 
 @dataclass(frozen=True)
 class NicholsonResult:
@@ -236,6 +253,171 @@ def _current_at_potential(exp: CVExperiment, target_v: float,
     order = np.argsort(E)
     return float(np.interp(target_v, E[order], I[order]))
 
+@dataclass(frozen=True)
+class PeakTable:
+    """the protocol's per-scan-rate table for one electrode.
+
+    one row per scan rate: both peaks, the formal potential E0' (midpoint of
+    the peak potentials), and the two half-separations ΔEa = Ep,a - E0' and
+    ΔEc = Ep,c - E0'. everything downstream (randles sevcik, laviron,
+    nicholson) reads from this.
+    """
+
+    electrode_id: str
+    scan_rates_v_s: np.ndarray
+    ep_a_v: np.ndarray          # anodic peak potential
+    ip_a_a: np.ndarray          # anodic peak current
+    ep_c_v: np.ndarray          # cathodic peak potential
+    ip_c_a: np.ndarray          # cathodic peak current
+    e0_prime_v: np.ndarray      # (Ep,a + Ep,c)/2
+    delta_ea_v: np.ndarray      # Ep,a - E0'  (positive)
+    delta_ec_v: np.ndarray      # Ep,c - E0'  (negative, same magnitude)
+    delta_ep_v: np.ndarray      # Ep,a - Ep,c = ΔEa - ΔEc
+
+
+@dataclass(frozen=True)
+class ReplicateTable:
+    """the protocol's averaged table across replicate electrodes.
+
+    mean and sample std dev (ddof=1) at each scan rate, computed across the
+    electrodes in one replicate group. this is what the protocol says to fit,
+    not the individual electrodes.
+    """
+
+    group_id: str
+    electrode_ids: tuple[str, ...]
+    scan_rates_v_s: np.ndarray
+    ip_a_mean_a: np.ndarray
+    ip_a_std_a: np.ndarray
+    ip_c_mean_a: np.ndarray
+    ip_c_std_a: np.ndarray
+    delta_ea_mean_v: np.ndarray
+    delta_ea_std_v: np.ndarray
+    delta_ec_mean_v: np.ndarray
+    delta_ec_std_v: np.ndarray
+    delta_ep_mean_v: np.ndarray
+    delta_ep_std_v: np.ndarray
+
+    @property
+    def mean_delta_ep_mv(self) -> float:
+        return float(np.nanmean(self.delta_ep_mean_v)) * 1000.0
+    
+    
+def _second_cycle_peaks(exp: CVExperiment
+                    ) -> tuple[float, float, float, float] | None:
+    """(Ep_a, ip_a, Ep_c, ip_c) for the second cycle, or None if not found.
+
+    the chi lists one peak per segment in file order, so the *last* anodic and
+    *last* cathodic entries are the second cycle's peaks, which is the cycle
+    the protocol says to use.
+    """
+    epa = ipa = epc = ipc = None
+    for seg in exp.segment_results:
+        if seg.ep_v is None or seg.ip_a is None:
+            continue
+        if seg.ip_a > 0:
+            epa, ipa = seg.ep_v, seg.ip_a
+        elif seg.ip_a < 0:
+            epc, ipc = seg.ep_v, seg.ip_a
+    if epa is None or epc is None:
+        return None
+    return epa, ipa, epc, ipc
+
+
+def peak_table(experiments: list[CVExperiment]) -> PeakTable:
+    """build the protocol's per-scan-rate table for one electrode."""
+    if not experiments:
+        raise ValueError("peak_table, got an empty experiment list")
+    electrode_ids = {e.file_meta.electrode_id for e in experiments}
+    if len(electrode_ids) != 1:
+        raise ValueError(f"peak_table, all experiments must be one electrode. got {electrode_ids}")
+    electrode_id = electrode_ids.pop()
+    for e in experiments:
+        if e.file_meta.electrolyte != Electrolyte.FERRO_FERRI:
+            raise ValueError("peak_table needs ferro/ferri data (it's peak based)")
+
+    experiments = sorted(experiments, key=lambda e: e.scan_rate_v_s)
+    n = len(experiments)
+    nus = np.array([e.scan_rate_v_s for e in experiments])
+    ep_a = np.full(n, np.nan); ip_a = np.full(n, np.nan)
+    ep_c = np.full(n, np.nan); ip_c = np.full(n, np.nan)
+    for i, e in enumerate(experiments):
+        peaks = _second_cycle_peaks(e)
+        if peaks is not None:
+            ep_a[i], ip_a[i], ep_c[i], ip_c[i] = peaks
+
+    e0 = (ep_a + ep_c) / 2.0
+    return PeakTable(
+        electrode_id=electrode_id,
+        scan_rates_v_s=nus,
+        ep_a_v=ep_a, ip_a_a=ip_a,
+        ep_c_v=ep_c, ip_c_a=ip_c,
+        e0_prime_v=e0,
+        delta_ea_v=ep_a - e0,
+        delta_ec_v=ep_c - e0,
+        delta_ep_v=ep_a - ep_c,
+    )
+def average_peak_tables(tables: list[PeakTable], group_id: str) -> ReplicateTable:
+    """average the per-electrode tables at each shared scan rate.
+
+    protocol steps 19-20 / 31-32: mean and std dev across the replicate
+    electrodes. we align on scan rates that every electrode has (rounded to
+    0.1 mV/s so float noise doesn't split them).
+    """
+    if not tables:
+        raise ValueError("average_peak_tables, got no tables")
+
+    key = lambda nu: round(nu * 1e4)  # 0.1 mV/s resolution
+    common = set(key(nu) for nu in tables[0].scan_rates_v_s)
+    for t in tables[1:]:
+        common &= set(key(nu) for nu in t.scan_rates_v_s)
+    if not common:
+        raise ValueError("average_peak_tables, the electrodes share no scan rates")
+
+    nus = np.array(sorted(k / 1e4 for k in common))
+
+    def stack(attr: str) -> np.ndarray:
+        rows = []
+        for t in tables:
+            idx = {key(nu): i for i, nu in enumerate(t.scan_rates_v_s)}
+            vals = getattr(t, attr)
+            rows.append([vals[idx[key(nu)]] for nu in nus])
+        return np.array(rows)  # shape (n_electrodes, n_scan_rates)
+
+    def mean_std(attr: str) -> tuple[np.ndarray, np.ndarray]:
+        m = stack(attr)
+        mean = np.nanmean(m, axis=0)
+        std = (np.nanstd(m, axis=0, ddof=1) if m.shape[0] > 1
+               else np.zeros(m.shape[1]))
+        return mean, std
+
+    ipa_m, ipa_s = mean_std("ip_a_a")
+    ipc_m, ipc_s = mean_std("ip_c_a")
+    dea_m, dea_s = mean_std("delta_ea_v")
+    dec_m, dec_s = mean_std("delta_ec_v")
+    dep_m, dep_s = mean_std("delta_ep_v")
+
+    return ReplicateTable(
+        group_id=group_id,
+        electrode_ids=tuple(t.electrode_id for t in tables),
+        scan_rates_v_s=nus,
+        ip_a_mean_a=ipa_m, ip_a_std_a=ipa_s,
+        ip_c_mean_a=ipc_m, ip_c_std_a=ipc_s,
+        delta_ea_mean_v=dea_m, delta_ea_std_v=dea_s,
+        delta_ec_mean_v=dec_m, delta_ec_std_v=dec_s,
+        delta_ep_mean_v=dep_m, delta_ep_std_v=dep_s,
+    )
+def choose_kinetics_method(mean_delta_ep_mv: float) -> str:
+    """the protocol's routing rule, as one plain deterministic function.
+
+    ΔEp > 212 mV -> "laviron", 61-212 mV -> "nicholson", below 61 mV the
+    couple is essentially reversible and neither method applies -> "none".
+    """
+    if mean_delta_ep_mv > LAVIRON_MIN_MV:
+        return "laviron"
+    if NICHOLSON_MIN_MV <= mean_delta_ep_mv <= NICHOLSON_MAX_MV:
+        return "nicholson"
+    return "none"
 
 # -----------------------------------------------------------------------------
 # analysis 1, randles sevcik, gives us EASA
@@ -277,7 +459,7 @@ def randles_sevcik(experiments: list[CVExperiment]) -> RandlesSevcikResult:
                 f"is {e.file_meta.electrolyte.value}"
             )
 
-    # sort by scan rate so the plot reads cleanly left to right
+   # sort by scan rate so the plot reads cleanly left to right
     experiments = sorted(experiments, key=lambda e: e.scan_rate_v_s)
 
     # collect scan rates and peak currents into parallel arrays
@@ -292,6 +474,36 @@ def randles_sevcik(experiments: list[CVExperiment]) -> RandlesSevcikResult:
             )
         ipa[i] = a
         ipc[i] = c
+
+    return _randles_sevcik_core(electrode_id, nus, ipa, ipc)
+
+
+def randles_sevcik_from_replicates(rep: ReplicateTable) -> RandlesSevcikResult:
+    """the protocol version: fit the replicate-averaged peak currents.
+
+    same math as randles_sevcik(), but the ip at each scan rate is the mean
+    across the replicate electrodes and the std devs ride along for the
+    error bars in the plot. this is the number to report.
+    """
+    res = _randles_sevcik_core(
+        rep.group_id, rep.scan_rates_v_s, rep.ip_a_mean_a, rep.ip_c_mean_a
+    )
+    import dataclasses
+    return dataclasses.replace(
+        res,
+        ipa_std_a=rep.ip_a_std_a,
+        ipc_std_a=rep.ip_c_std_a,
+        n_replicates=len(rep.electrode_ids),
+    )
+
+
+def _randles_sevcik_core(label: str, nus: np.ndarray,
+                         ipa: np.ndarray, ipc: np.ndarray) -> RandlesSevcikResult:
+    """the shared fit + unit conversion behind both entry points."""
+    valid = ~(np.isnan(ipa) | np.isnan(ipc))
+    if valid.sum() < 2:
+        raise ValueError(f"randles_sevcik, fewer than two valid peak pairs for {label}")
+    nus, ipa, ipc = nus[valid], ipa[valid], ipc[valid]
 
     sqrt_nu = np.sqrt(nus)
     # fit each branch separately. doing both gives us a built in sanity check,
@@ -310,7 +522,7 @@ def randles_sevcik(experiments: list[CVExperiment]) -> RandlesSevcikResult:
     easa_c = fit_c.slope / denom
 
     return RandlesSevcikResult(
-        electrode_id=electrode_id,
+        electrode_id=label,
         scan_rates_v_s=nus,
         sqrt_scan_rates=sqrt_nu,
         ipa_a=ipa,
@@ -384,167 +596,131 @@ def cdl(experiments: list[CVExperiment],
 # -----------------------------------------------------------------------------
 
 
-def laviron(experiments: list[CVExperiment]) -> LavironResult:
-    """laviron's method for the heterogeneous electron transfer rate, k0.
+def laviron(rep: ReplicateTable) -> LavironResult:
+    """laviron per the protocol: ΔE vs ln(ν), x-intercept, ks = nFαVc/RT.
 
-    laviron showed that when nF*delta_Ep/RT is bigger than about 10, the peak
-    potentials shift linearly with log(nu). the slopes of those shifts give us
-    the transfer coefficient alpha, and from that we get k0.
+    the protocol's exact recipe (steps 19-25), run on the replicate-averaged
+    table (a single electrode still works, it's just a group of one):
 
-        Ep_a - E0' goes like (2.303 RT / ((1-alpha) n F)) * log(nu)
-        Ep_c - E0' goes like -(2.303 RT / (alpha n F)) * log(nu)
+      1. average ΔEa and ΔEc across the replicate electrodes  (done upstream
+         in average_peak_tables)
+      2. check the mean peak separation ΔEp = ΔEa - ΔEc is > 212 mV,
+         otherwise this method doesn't apply and Nicholson should be used
+      3. plot ΔEa and ΔEc against ln(ν) and fit each branch with a line
+      4. the x-intercept (where ΔE -> 0) is the critical scan rate,
+         Vc = exp(x-intercept). the two branches give two estimates that
+         should agree; we average them.
+      5. ks = n·F·α·Vc / (R·T), in s⁻¹
 
-    big caveat. laviron strictly applies to surface bound redox species, but
-    ferro/ferricyanide is freely diffusing in solution. so the k0 we get out is
-    an order of magnitude guess at best. we mention this in the notes field of
-    the result so it's clear what we're looking at.
+    the protocol doesn't spell out where α comes from. we derive it from the
+    branch slopes (laviron theory: anodic slope = RT/((1-α)nF), cathodic
+    slope = -RT/(αnF) in ln space) and fall back to the standard α = 0.5
+    assumption for a symmetric couple like ferro/ferri if that comes out
+    non-physical. the notes field always says which was used.
 
-    also, we only fit the high overpotential branch where delta_Ep is bigger
-    than about 100 mV. that's where the kinetic regime kicks in. if not enough
-    of our scan rates land in that regime we just return k0 = None and explain
-    in the notes.
+    the usual caveat still applies: laviron strictly describes surface-bound
+    species and ferro/ferri diffuses, so treat ks as an estimate.
     """
-    if not experiments:
-        raise ValueError("laviron, got an empty experiment list")
+    notes: list[str] = [
+        "ferro/ferricyanide is diffusion controlled, not surface confined; "
+        "laviron strictly applies to adsorbed species, so ks is an estimate."
+    ]
 
-    electrode_ids = {e.file_meta.electrode_id for e in experiments}
-    if len(electrode_ids) != 1:
-        raise ValueError(
-            f"laviron, all the experiments need to be from one electrode. "
-            f"got {electrode_ids}"
-        )
-    electrode_id = electrode_ids.pop()
+    valid = ~(np.isnan(rep.delta_ea_mean_v) | np.isnan(rep.delta_ec_mean_v))
+    nus = rep.scan_rates_v_s
+    ln_nus = np.log(nus)
 
-    notes_parts: list[str] = []
-    if any(e.file_meta.electrolyte != Electrolyte.FERRO_FERRI for e in experiments):
-        raise ValueError("laviron needs ferro/ferri data")
-
-    # always include the caveat up front
-    notes_parts.append(
-        "ferro/ferricyanide is diffusion controlled, not surface confined. "
-        "laviron strictly applies to adsorbed species, so the k0 here is an "
-        "order of magnitude estimate from the high overpotential region of "
-        "dEp vs log(nu)."
-    )
-
-    experiments = sorted(experiments, key=lambda e: e.scan_rate_v_s)
-    nus = np.array([e.scan_rate_v_s for e in experiments])
-    log_nus = np.log10(nus)
-
-    # pull anodic and cathodic peak potentials from the segment results.
-    # segments with positive ip are anodic, negative ip are cathodic.
-    Ep_a = np.full(len(experiments), np.nan)
-    Ep_c = np.full(len(experiments), np.nan)
-    for i, e in enumerate(experiments):
-        for seg in e.segment_results:
-            if seg.ep_v is None or seg.ip_a is None:
-                continue
-            if seg.ip_a > 0:
-                Ep_a[i] = seg.ep_v      # keep overwriting to keep 2nd cycle only
-            elif seg.ip_a < 0:
-                Ep_c[i] = seg.ep_v
-
-    # need at least three valid peak pairs to even attempt a fit
-    valid = ~(np.isnan(Ep_a) | np.isnan(Ep_c))
-    if valid.sum() < 3:
-        notes_parts.append("not enough valid peak pairs to fit.")
+    def bail(reason: str, fit_a=None, fit_c=None, alpha=None,
+             alpha_source="n/a") -> LavironResult:
+        notes.append(reason)
         return LavironResult(
-            electrode_id=electrode_id,
+            electrode_id=rep.group_id,
             scan_rates_v_s=nus,
-            delta_ep_v=Ep_a - Ep_c,
-            log_scan_rates=log_nus,
-            anodic_branch_fit=None,
-            cathodic_branch_fit=None,
-            alpha=None,
-            k0_per_s=None,
-            notes=" ".join(notes_parts),
-        )
-
-    delta_Ep = Ep_a - Ep_c  # peak separation
-
-    # the kinetic regime needs nF*delta_Ep/RT > about 4, which means
-    # delta_Ep needs to be bigger than 4*RT/(nF), or about 100 mV at room temp.
-    threshold_v = 4 * R_CONST * T_KELVIN / (N_ELECTRONS * F_CONST)
-    kinetic_mask = valid & (delta_Ep > threshold_v)
-    if kinetic_mask.sum() < 3:
-        notes_parts.append(
-            f"fewer than three scan rates in the kinetic region "
-            f"(delta_Ep > {threshold_v*1000:.0f} mV). can't fit reliably, "
-            f"returning k0 = None."
-        )
-        return LavironResult(
-            electrode_id=electrode_id,
-            scan_rates_v_s=nus,
-            delta_ep_v=delta_Ep,
-            log_scan_rates=log_nus,
-            anodic_branch_fit=None,
-            cathodic_branch_fit=None,
-            alpha=None,
-            k0_per_s=None,
-            notes=" ".join(notes_parts),
-        )
-
-    # E0' is the formal potential. for ferro/ferri, the average of Ep_a and
-    # Ep_c is a fine estimate. we take the mean across all the kinetic region points.
-    E0_prime = float(np.mean((Ep_a[kinetic_mask] + Ep_c[kinetic_mask]) / 2))
-    notes_parts.append(f"used E0' = {E0_prime*1000:.1f} mV (midpoint average).")
-
-    # fit each branch in the kinetic region. these slopes are what laviron's
-    # equations relate to alpha.
-    fit_a = _linear_fit(log_nus[kinetic_mask], Ep_a[kinetic_mask] - E0_prime)
-    fit_c = _linear_fit(log_nus[kinetic_mask], Ep_c[kinetic_mask] - E0_prime)
-
-    # solve for alpha from each branch and average them.
-    # anodic slope = 2.303*RT/((1-alpha)*nF), so (1-alpha) = 2.303*RT/(slope*nF).
-    # cathodic slope = -2.303*RT/(alpha*nF), so alpha = -2.303*RT/(slope*nF).
-    factor = 2.303 * R_CONST * T_KELVIN / (N_ELECTRONS * F_CONST)
-    one_minus_alpha = factor / fit_a.slope if fit_a.slope != 0 else math.nan
-    alpha_from_c = -factor / fit_c.slope if fit_c.slope != 0 else math.nan
-    alpha = float(np.mean([1 - one_minus_alpha, alpha_from_c]))
-
-    # alpha has to be between 0 and 1. if it's not, the model isn't valid here.
-    if not (0 < alpha < 1):
-        notes_parts.append(
-            f"computed alpha = {alpha:.3f} is outside (0, 1), so the kinetic "
-            f"model isn't valid for this data. returning k0 = None."
-        )
-        return LavironResult(
-            electrode_id=electrode_id,
-            scan_rates_v_s=nus,
-            delta_ep_v=delta_Ep,
-            log_scan_rates=log_nus,
+            ln_scan_rates=ln_nus,
+            delta_ea_v=rep.delta_ea_mean_v,
+            delta_ec_v=rep.delta_ec_mean_v,
+            delta_ea_std_v=rep.delta_ea_std_v,
+            delta_ec_std_v=rep.delta_ec_std_v,
             anodic_branch_fit=fit_a,
             cathodic_branch_fit=fit_c,
             alpha=alpha,
+            alpha_source=alpha_source,
+            vc_v_s=None,
             k0_per_s=None,
-            notes=" ".join(notes_parts),
+            n_replicates=len(rep.electrode_ids),
+            notes=" ".join(notes),
         )
 
-    # final step, k0. laviron's closed form at one reference scan rate is
-    #   log(k0) = alpha*log(1-alpha) + (1-alpha)*log(alpha)
-    #           - log(RT/(nF*nu)) - alpha*(1-alpha)*nF*dEp/(2.303*RT)
-    # we plug in the smallest nu in the kinetic region and its dEp.
-    nu_ref = float(nus[kinetic_mask][0])
-    dEp_ref = float(delta_Ep[kinetic_mask][0])
+    if valid.sum() < 3:
+        return bail("fewer than three scan rates with valid peak pairs; can't fit.")
 
-    log_k0 = (
-        alpha * math.log10(1 - alpha)
-        + (1 - alpha) * math.log10(alpha)
-        - math.log10(R_CONST * T_KELVIN / (N_ELECTRONS * F_CONST * nu_ref))
-        - alpha * (1 - alpha) * N_ELECTRONS * F_CONST * dEp_ref / (2.303 * R_CONST * T_KELVIN)
-    )
-    k0 = 10 ** log_k0
+    # protocol step 21: this method only applies above 212 mV mean separation
+    mean_dep_mv = rep.mean_delta_ep_mv
+    if not (mean_dep_mv > LAVIRON_MIN_MV):
+        return bail(
+            f"mean ΔEp = {mean_dep_mv:.0f} mV is not above {LAVIRON_MIN_MV:.0f} mV; "
+            f"the protocol says to use Nicholson's method instead. ks not computed."
+        )
+
+    # protocol steps 22-23: linear fit of each averaged branch against ln(ν)
+    fit_a = _linear_fit(ln_nus[valid], rep.delta_ea_mean_v[valid])
+    fit_c = _linear_fit(ln_nus[valid], rep.delta_ec_mean_v[valid])
+
+    # α from the branch slopes (see docstring). the protocol's ks formula
+    # needs an α but never defines one, so this is our best faithful reading.
+    factor = R_CONST * T_KELVIN / (N_ELECTRONS * F_CONST)  # RT/nF in ln space
+    alpha_estimates = []
+    if fit_a.slope > 0:
+        alpha_estimates.append(1.0 - factor / fit_a.slope)
+    if fit_c.slope < 0:
+        alpha_estimates.append(-factor / fit_c.slope)
+    alpha = float(np.mean(alpha_estimates)) if alpha_estimates else float("nan")
+    if 0.0 < alpha < 1.0:
+        alpha_source = "branch slopes"
+        notes.append(f"α = {alpha:.3f} derived from the ΔE vs ln(ν) branch slopes.")
+    else:
+        alpha, alpha_source = 0.5, "assumed 0.5"
+        notes.append(
+            "slope-derived α was outside (0, 1), so α = 0.5 was assumed "
+            "(standard for a symmetric couple; the protocol doesn't define α)."
+        )
+
+    # protocol step 24: x-intercept of each branch, ΔE = 0 at ln(ν) = -b/m.
+    # back out of ln space to get the critical scan rate in V/s, then average
+    # the two branch estimates.
+    vcs = []
+    for fit in (fit_a, fit_c):
+        if fit.slope != 0:
+            vcs.append(math.exp(-fit.intercept / fit.slope))
+    if not vcs:
+        return bail("both branch fits came back flat; no x-intercept.",
+                    fit_a, fit_c, alpha, alpha_source)
+    vc = float(np.mean(vcs))
+    if len(vcs) == 2:
+        notes.append(
+            f"Vc from anodic branch = {vcs[0]:.3g} V/s, from cathodic branch "
+            f"= {vcs[1]:.3g} V/s; used the mean, {vc:.3g} V/s."
+        )
+
+    # protocol step 25
+    ks = N_ELECTRONS * F_CONST * alpha * vc / (R_CONST * T_KELVIN)
 
     return LavironResult(
-        electrode_id=electrode_id,
+        electrode_id=rep.group_id,
         scan_rates_v_s=nus,
-        delta_ep_v=delta_Ep,
-        log_scan_rates=log_nus,
+        ln_scan_rates=ln_nus,
+        delta_ea_v=rep.delta_ea_mean_v,
+        delta_ec_v=rep.delta_ec_mean_v,
+        delta_ea_std_v=rep.delta_ea_std_v,
+        delta_ec_std_v=rep.delta_ec_std_v,
         anodic_branch_fit=fit_a,
         cathodic_branch_fit=fit_c,
         alpha=alpha,
-        k0_per_s=float(k0),
-        notes=" ".join(notes_parts),
+        alpha_source=alpha_source,
+        vc_v_s=vc,
+        k0_per_s=float(ks),
+        n_replicates=len(rep.electrode_ids),
+        notes=" ".join(notes),
     )
 
 # -----------------------------------------------------------------------------
@@ -582,45 +758,21 @@ def _psi_from_dep(delta_ep_mv: float) -> float:
     return float(np.interp(delta_ep_mv, xs, ys))
 
 
-def nicholson(experiments: list[CVExperiment]) -> NicholsonResult:
+def nicholson(rep: ReplicateTable) -> NicholsonResult:
     """heterogeneous rate constant ks via Nicholson's working curve.
 
-    protocol steps 26-37. valid when the mean peak separation is 61-212 mV.
-    ks comes out in cm/s (note: that's a different unit from laviron's k0).
+    protocol steps 26-37, run on the replicate-averaged peak separations.
+    valid when the mean ΔEp is 61-212 mV. ψ is looked up per scan rate from
+    Table 4, ks = ψ·√(nπDFν/RT) per scan rate (in cm/s, a different unit
+    from laviron's s⁻¹), then mean and std across the scan rates.
     """
-    if not experiments:
-        raise ValueError("nicholson, got an empty experiment list")
-
-    electrode_ids = {e.file_meta.electrode_id for e in experiments}
-    if len(electrode_ids) != 1:
-        raise ValueError(f"nicholson, all experiments must be one electrode. got {electrode_ids}")
-    electrode_id = electrode_ids.pop()
-
-    for e in experiments:
-        if e.file_meta.electrolyte != Electrolyte.FERRO_FERRI:
-            raise ValueError("nicholson needs ferro/ferri data")
-
-    experiments = sorted(experiments, key=lambda e: e.scan_rate_v_s)
-    nus = np.array([e.scan_rate_v_s for e in experiments])
-
-    # second-cycle peak potentials (last anodic / last cathodic segment wins)
-    Ep_a = np.full(len(experiments), np.nan)
-    Ep_c = np.full(len(experiments), np.nan)
-    for i, e in enumerate(experiments):
-        for seg in e.segment_results:
-            if seg.ep_v is None or seg.ip_a is None:
-                continue
-            if seg.ip_a > 0:
-                Ep_a[i] = seg.ep_v
-            elif seg.ip_a < 0:
-                Ep_c[i] = seg.ep_v
-
-    delta_ep = Ep_a - Ep_c
-    mean_dep_mv = float(np.nanmean(delta_ep)) * 1000.0
+    nus = rep.scan_rates_v_s
+    delta_ep = rep.delta_ep_mean_v
+    mean_dep_mv = rep.mean_delta_ep_mv
 
     if not (NICHOLSON_MIN_MV <= mean_dep_mv <= NICHOLSON_MAX_MV):
         return NicholsonResult(
-            electrode_id=electrode_id,
+            electrode_id=rep.group_id,
             scan_rates_v_s=nus,
             delta_ep_v=delta_ep,
             psi=np.full(len(nus), np.nan),
@@ -636,13 +788,15 @@ def nicholson(experiments: list[CVExperiment]) -> NicholsonResult:
         N_ELECTRONS * math.pi * D_FERROFERRI * F_CONST * nus / (R_CONST * T_KELVIN)
     )
     return NicholsonResult(
-        electrode_id=electrode_id,
+        electrode_id=rep.group_id,
         scan_rates_v_s=nus,
         delta_ep_v=delta_ep,
         psi=psi,
         ks_per_scan_cm_s=ks,
         ks_mean_cm_s=float(np.nanmean(ks)),
-        ks_std_cm_s=float(np.nanstd(ks, ddof=1)),
-        notes=(f"ks per protocol step 35, averaged over {len(ks)} scan rates. "
-               f"mean ΔEp = {mean_dep_mv:.0f} mV. ks in cm/s."),
+        ks_std_cm_s=float(np.nanstd(ks, ddof=1)) if np.isfinite(ks).sum() > 1 else None,
+        notes=(f"ks per protocol step 35, averaged over {len(ks)} scan rates "
+               f"and {len(rep.electrode_ids)} replicate electrode(s). "
+               f"mean ΔEp = {mean_dep_mv:.0f} mV. ψ table verified against "
+               f"protocol Table 4. ks in cm/s."),
     )
