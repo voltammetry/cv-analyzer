@@ -43,15 +43,18 @@ instead of dropping them, so the segment count still matches what the machine sa
 
 from __future__ import annotations
 
+import csv
+import dataclasses
 import re
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
-from .filename import parse_filename
+from .filename import FilenameParseError, parse_filename
 from .models import (
     CVExperiment,
+    Electrolyte,
     FileMetadata,
     InstrumentMetadata,
     SegmentResult,
@@ -91,19 +94,82 @@ _DATA_HEADER_RE = re.compile(r"^Potential/V\s*,\s*Current/A")
 class CVParseError(ValueError):
     """thrown when we can't make sense of a file."""
 
+def classify_electrolyte(low_e_v: float, high_e_v: float) -> Electrolyte:
+    """figure out the experiment type from the potential window in the header.
 
-def parse_cv_file(path: str | Path) -> CVExperiment:
+    the protocol uses two very different windows:
+      - redox (ferro/ferri) experiments sweep -0.2 V to +0.6 V
+      - cdl (pbs) experiments sweep a narrow +0.5 V to +0.6/0.7 V window
+    so the window alone tells us which experiment this is. this is the
+    machine's own record of what it ran, which beats trusting the filename.
+    """
+    width = high_e_v - low_e_v
+    if low_e_v <= 0.0 and high_e_v >= 0.4 and width >= 0.5:
+        return Electrolyte.FERRO_FERRI
+    if low_e_v >= 0.3 and width <= 0.35:
+        return Electrolyte.PBS
+    return Electrolyte.UNKNOWN
+
+def read_manifest(directory: str | Path) -> dict[str, dict[str, str]]:
+    """read the optional manifest.csv sitting next to the data files.
+
+    the manifest is how the user explicitly sets electrode identity, size and
+    replicate grouping instead of us guessing from the filename. format is a
+    plain csv with a header row; only `filename` is required, everything else
+    is optional and overrides whatever we inferred:
+
+        filename,electrode_id,electrode_size_mm,replicate_group,electrolyte
+        cv_sp1_ab2_5mvs_051226_0206_ff.csv,ab2,1,batchA,ferro_ferri
+
+    returns {filename (lowercased): {column: value}}. missing file -> {}.
+    """
+    manifest_path = Path(directory) / "manifest.csv"
+    if not manifest_path.exists():
+        return {}
+    entries: dict[str, dict[str, str]] = {}
+    with manifest_path.open(newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            name = (row.get("filename") or "").strip().lower()
+            if not name:
+                continue
+            entries[name] = {k: v.strip() for k, v in row.items()
+                             if k != "filename" and v and v.strip()}
+    return entries
+
+def _fallback_file_meta(path: Path) -> FileMetadata:
+    """metadata for a file whose name doesn't follow the convention.
+
+    the filename convention is now a convenience, not a requirement. if the
+    name doesn't match, we use the stem as the electrode id and fill the rest
+    from the header (electrolyte) or the manifest (size, grouping) later.
+    """
+    return FileMetadata(
+        electrode_id=path.stem.lower(),
+        scan_rate_mv_s=float("nan"),   # replaced by the header value below
+        experiment_date="",
+        batch_code="",
+        electrolyte=Electrolyte.UNKNOWN,
+        source_path=path,
+        electrode_size_mm=1,
+    )
+
+def parse_cv_file(path: str | Path,
+                  manifest_entry: dict[str, str] | None = None) -> CVExperiment:
     """read one chi .csv file and hand back a CVExperiment.
 
-    raises CVParseError if the file is broken, or FilenameParseError if the
-    name is off pattern.
+    raises CVParseError if the file is broken. an off-pattern filename is no
+    longer fatal: we fall back to header + manifest metadata instead.
     """
     path = Path(path)
     if not path.exists():
         raise CVParseError(f"can't find the file {path}")
 
-    # name first, since that's quick and tells us electrode and electrolyte
-    file_meta = parse_filename(path)
+    # the filename is now just a pre-fill. if it doesn't match the convention
+    # we shrug and move on; the header and the manifest are the real sources.
+    try:
+        file_meta = parse_filename(path)
+    except FilenameParseError:
+        file_meta = _fallback_file_meta(path)
 
     # chi writes these with windows line endings and the odd trailing space, so
     # we read the whole thing as text, strip each line, then walk through it.
@@ -123,6 +189,39 @@ def parse_cv_file(path: str | Path) -> CVExperiment:
         instrument_model=instrument_model,
         **header_values,
     )
+
+    # the header is the source of truth for what experiment this was. the
+    # filename's batch-code guess is only kept if the header is inconclusive.
+    header_electrolyte = classify_electrolyte(
+        instrument_meta.low_e_v, instrument_meta.high_e_v
+    )
+    if header_electrolyte is not Electrolyte.UNKNOWN:
+        if (file_meta.electrolyte is not Electrolyte.UNKNOWN
+                and file_meta.electrolyte is not header_electrolyte):
+            print(f"heads up, {path.name}: filename says "
+                  f"{file_meta.electrolyte.value} but the potential window "
+                  f"says {header_electrolyte.value}. trusting the header.")
+        file_meta = dataclasses.replace(file_meta, electrolyte=header_electrolyte)
+
+    # a nan scan rate means the filename didn't have one; the header always does
+    if file_meta.scan_rate_mv_s != file_meta.scan_rate_mv_s:  # nan check
+        file_meta = dataclasses.replace(
+            file_meta, scan_rate_mv_s=instrument_meta.scan_rate_v_s * 1000.0
+        )
+
+    # finally, the manifest (explicit user input) overrides everything
+    if manifest_entry:
+        overrides: dict[str, object] = {}
+        if "electrode_id" in manifest_entry:
+            overrides["electrode_id"] = manifest_entry["electrode_id"].lower()
+        if "electrode_size_mm" in manifest_entry:
+            overrides["electrode_size_mm"] = int(float(manifest_entry["electrode_size_mm"]))
+        if "replicate_group" in manifest_entry:
+            overrides["replicate_group"] = manifest_entry["replicate_group"]
+        if "electrolyte" in manifest_entry:
+            overrides["electrolyte"] = Electrolyte(manifest_entry["electrolyte"].lower())
+        if overrides:
+            file_meta = dataclasses.replace(file_meta, **overrides)
 
     return CVExperiment(
         file_meta=file_meta,
@@ -300,10 +399,13 @@ def parse_directory(
     have it stop on the first problem.
     """
     directory = Path(directory)
+    manifest = read_manifest(directory)
     experiments: list[CVExperiment] = []
     for fp in sorted(directory.glob(pattern)):
+        if fp.name.lower() == "manifest.csv":
+            continue
         try:
-            experiments.append(parse_cv_file(fp))
+            experiments.append(parse_cv_file(fp, manifest.get(fp.name.lower())))
         except (CVParseError, ValueError) as exc:
             if skip_on_error:
                 print(f"heads up, skipping {fp.name} because {exc}")
