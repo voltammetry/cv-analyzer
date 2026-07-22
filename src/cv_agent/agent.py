@@ -1,27 +1,21 @@
-"""the actual ai agent layer.
+"""interpretation layer: deterministic decisions, optional llm phrasing.
 
-so far the analyses are just plain functions. this file is what makes the
-project an agent, not just a pipeline. there's two things the agent does that
-a hardcoded script can't.
+this file used to be "the agent": an llm decided which analyses to run and
+eyeballed outliers. that was the wrong shape for this problem. every decision
+in the protocol is a fixed numeric rule (the laviron/nicholson choice is just
+a 212 mV threshold on peak separation), and stats should be computed, not
+estimated by a language model. so:
 
-  1. it decides which analyses to run. given a list of cv files for one
-     electrode, it looks at what we have (electrolyte, scan rates, peak
-     separations, fit r squared) and picks the right analyses for that
-     situation. for the simple cases this matches what a hardcoded rule would
-     do (ferro/ferri gets randles sevcik and laviron, pbs gets cdl). but the
-     llm can also catch weird cases, like flagging that laviron won't work on
-     a given electrode because the peak separations are too small.
-
-  2. it writes a short human readable interpretation of the results. things
-     like "this electrode has a roughness factor of about 1.6, which is in
-     the normal range for laser cut gold" or "the r squared on the cathodic
-     fit is lower than the anodic one, worth a closer look at the lower scan
-     rates." the kind of thing you'd write in your lab notebook after
-     looking at the report.
-
-the agent uses anthropic's claude api. if no api key is set, it falls back to
-a deterministic routing function so the project still works end to end without
-the agent, just without the smart parts.
+  - decide() is now purely deterministic. it applies the protocol's rules and
+    nothing else. same inputs, same outputs, every time.
+  - compare() computes all of its stats (means, 1σ outliers, bad fits) in
+    code, always. if ANTHROPIC_API_KEY is set, the llm may rewrite the
+    *overview paragraph* in nicer prose from the already-computed numbers,
+    but it never produces a number or an outlier call itself.
+  - interpret() writes the plain-language summary of finished results. this
+    is the one place an llm genuinely helps, and it only ever describes
+    numbers that were already computed. without a key, a rule-based summary
+    is built from the same numbers.
 """
 
 from __future__ import annotations
@@ -29,8 +23,9 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
+import math
 
-from .analysis import CdlResult, LavironResult, RandlesSevcikResult
+from .analysis import CdlResult, LavironResult, RandlesSevcikResult, choose_kinetics_method
 from .models import CVExperiment, Electrolyte
 
 
@@ -106,15 +101,17 @@ def _deterministic_decide(experiments: list[CVExperiment]) -> AgentDecision:
         analyses.add("randles_sevcik")
         ff = [e for e in experiments if e.file_meta.electrolyte == Electrolyte.FERRO_FERRI]
         sep_mv = _mean_peak_separation_mv(ff)
-        if sep_mv is not None and sep_mv > 212:
-            analyses.add("laviron")
-            reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV > 212, so randles sevcik + laviron")
-        elif sep_mv is not None and sep_mv >= 61:
-            analyses.add("nicholson")
-            reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV in 61-212, so randles sevcik + nicholson")
-        else:
+        if sep_mv is None:
             analyses.add("laviron")
             reasons.append("ferro/ferri; ΔEp unknown, defaulting to randles sevcik + laviron")
+        else:
+            method = choose_kinetics_method(sep_mv)
+            if method != "none":
+                analyses.add(method)
+                reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV -> {method} (protocol thresholds)")
+            else:
+                reasons.append(f"ferro/ferri; ΔEp {sep_mv:.0f} mV < 61 mV, "
+                               f"essentially reversible, neither kinetics method applies")
     if Electrolyte.PBS in electrolytes:
         analyses.add("cdl")
         reasons.append("pbs data is here, so cdl for double layer capacitance")
@@ -141,7 +138,6 @@ def _deterministic_interpret(
         easa_mm2 = rs.easa_mean_cm2 * 1e2
         # geometric area of a disk = pi * r^2. for diameter d in mm,
         # area in mm² is pi * (d/2)² = pi * d² / 4
-        import math
         geom_area_mm2 = math.pi * (size_mm / 2) ** 2
         roughness = easa_mm2 / geom_area_mm2
         parts.append(
@@ -168,8 +164,9 @@ def _deterministic_interpret(
         if lav.k0_per_s is None:
             parts.append("laviron k0 wasn't resolved (see the caveat in the report).")
         else:
-            parts.append(f"laviron k0 came out around {lav.k0_per_s:.2e} s⁻¹ "
-                         f"(alpha = {lav.alpha:.2f}), order of magnitude only.")
+            parts.append(f"laviron ks came out around {lav.k0_per_s:.2e} s⁻¹ "
+                         f"(alpha = {lav.alpha:.2f}, {lav.alpha_source}; "
+                         f"averaged over {lav.n_replicates} replicate(s)).")
 
     summary = " ".join(parts) if parts else "no results to summarize."
     return AgentInterpretation(
@@ -241,15 +238,18 @@ def _build_interpret_prompt(
     rs: RandlesSevcikResult | None,
     cdl_res: CdlResult | None,
     lav: LavironResult | None,
+    size_mm: float = 1.0,
 ) -> str:
     """build the prompt that asks claude to interpret the results."""
     lines = [f"electrode id: {electrode_id}", ""]
 
     if rs is not None:
+        import math as _math
         easa_mm2 = rs.easa_mean_cm2 * 1e2
-        roughness = easa_mm2 / 0.785
+        geom_mm2 = _math.pi * (size_mm / 2) ** 2
+        roughness = easa_mm2 / geom_mm2
         lines.append("randles sevcik:")
-        lines.append(f"  EASA mean: {easa_mm2:.3f} mm² (geometric for 1 mm disk is 0.785 mm²)")
+        lines.append(f"  EASA mean: {easa_mm2:.3f} mm² (geometric for a {size_mm:g} mm disk is {geom_mm2:.3f} mm²)")
         lines.append(f"  roughness factor: {roughness:.2f}")
         lines.append(f"  anodic R²: {rs.anodic_fit.r_squared:.4f}")
         lines.append(f"  cathodic R²: {rs.cathodic_fit.r_squared:.4f}")
@@ -267,8 +267,8 @@ def _build_interpret_prompt(
             lines.append("  k0: not resolved")
             lines.append(f"  notes: {lav.notes}")
         else:
-            lines.append(f"  k0: {lav.k0_per_s:.3e} s⁻¹")
-            lines.append(f"  alpha: {lav.alpha:.3f}")
+            lines.append(f"  ks: {lav.k0_per_s:.3e} s⁻¹ (Vc = {lav.vc_v_s:.3g} V/s)")
+            lines.append(f"  alpha: {lav.alpha:.3f} ({lav.alpha_source})")
         lines.append("")
 
     summary_data = "\n".join(lines)
@@ -325,36 +325,15 @@ def _call_claude(prompt: str, api_key: str) -> dict:
 
 def decide(experiments: list[CVExperiment],
            use_llm: bool | None = None) -> AgentDecision:
-    """ask the agent which analyses to run for this electrode.
+    """which analyses apply to this electrode. purely deterministic.
 
-    if use_llm is None, we auto detect. we use the llm if ANTHROPIC_API_KEY is
-    set in the environment, otherwise we fall back to the deterministic rules.
-    if use_llm is True or False, we honor it.
+    this is the protocol's own routing rule and nothing else: ferro/ferri
+    data gets randles sevcik plus one kinetics method chosen by the mean
+    peak separation (>212 mV laviron, 61-212 mV nicholson), pbs data gets
+    cdl. the use_llm argument is kept so old callers don't break, but it is
+    ignored: method choice must be reproducible, so no llm is consulted.
     """
-    if not experiments:
-        raise ValueError("decide, got an empty experiment list")
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if use_llm is None:
-        use_llm = api_key is not None
-
-    if not use_llm or api_key is None:
-        return _deterministic_decide(experiments)
-
-    # try the llm. if anything goes wrong, fall back.
-    try:
-        prompt = _build_decide_prompt(experiments)
-        response = _call_claude(prompt, api_key)
-        analyses = set(response.get("analyses", [])) & _ALLOWED_ANALYSES
-        reasoning = response.get("reasoning", "")
-        return AgentDecision(
-            electrode_id=experiments[0].file_meta.electrode_id,
-            analyses_to_run=analyses,
-            reasoning=reasoning,
-        )
-    except Exception as exc:
-        print(f"heads up, agent decide call failed ({exc}). falling back to rules.")
-        return _deterministic_decide(experiments)
+    return _deterministic_decide(experiments)
 
 
 def interpret(
@@ -378,7 +357,7 @@ def interpret(
         return _deterministic_interpret(electrode_id, rs, cdl_res, lav)
 
     try:
-        prompt = _build_interpret_prompt(electrode_id, rs, cdl_res, lav)
+        prompt = _build_interpret_prompt(electrode_id, rs, cdl_res, lav, size_mm)
         response = _call_claude(prompt, api_key)
         return AgentInterpretation(
             electrode_id=electrode_id,
@@ -504,80 +483,44 @@ def _deterministic_compare(rows: list[dict]) -> AgentComparison:
     )
 
 
-def _build_compare_prompt(rows: list[dict]) -> str:
-    """build the prompt that asks claude to compare across all electrodes."""
-    # serialize the rows as a clean readable table
-    table_lines = []
-    for r in rows:
-        parts = [f"electrode {r['electrode_id']}"]
-        if r.get("easa_mm2") is not None:
-            roughness = r["easa_mm2"] / 0.785
-            parts.append(f"EASA={r['easa_mm2']:.3f} mm² (roughness {roughness:.2f})")
-            parts.append(f"RS R² anodic={r.get('rs_r2_anodic', '?'):.4f}")
-            parts.append(f"cathodic={r.get('rs_r2_cathodic', '?'):.4f}")
-        if r.get("cdl_uF") is not None:
-            parts.append(f"Cdl={r['cdl_uF']:.4f} µF")
-            parts.append(f"R²={r.get('cdl_r2', '?'):.4f}")
-        if r.get("laviron_k0_per_s") is not None:
-            parts.append(f"k0={r['laviron_k0_per_s']:.2e} s⁻¹")
-        table_lines.append("  " + ", ".join(parts))
-
-    table = "\n".join(table_lines)
-
-    return f"""you are reviewing a batch of cyclic voltammetry results across multiple electrodes.
-
-the electrodes were all fabricated using the same process (laser cut gold on
-polyimide with kapton tape masking). for a 1 mm working electrode the
-geometric area is 0.785 mm², so a roughness factor of 1.2 to 2.0 is normal.
-
-here are the per electrode results:
-
-{table}
-
-give me a cross electrode read on this batch. look for patterns (e.g. are
-some electrodes systematically worse?), outliers (which ones stand out and
-why), and recommendations (what should be done next). respond with valid
-json only, no markdown, no code fences. format:
-
-{{
-  "overview": "one short paragraph summarizing the batch as a whole",
-  "patterns": ["specific observation 1", "specific observation 2"],
-  "outliers": ["electrode_id: why it stands out", "..."],
-  "recommendations": ["concrete next step 1", "..."]
-}}
-
-be specific. reference electrode ids by name. keep it concise."""
 
 
 def compare(rows: list[dict], use_llm: bool | None = None) -> AgentComparison:
     """compare results across all electrodes, find patterns and outliers.
 
-    takes the same list of dict rows that we'd write to summary.csv, one per
-    electrode. each row has keys like electrode_id, easa_mm2, cdl_uF, etc.
-    same auto detection as decide() and interpret().
+    all the stats (means, ranges, 1σ outliers, low-R² fits) are computed in
+    code, every time. if an api key is set, the llm is allowed to rewrite the
+    overview paragraph in friendlier prose from those computed numbers, but
+    the patterns, outliers, and recommendations are always the computed ones.
     """
-    if not rows:
-        return AgentComparison(
-            overview="no electrodes to compare.",
-            patterns=[], outliers=[], recommendations=[],
-        )
+    det = _deterministic_compare(rows)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if use_llm is None:
         use_llm = api_key is not None
-
-    if not use_llm or api_key is None:
-        return _deterministic_compare(rows)
+    if not use_llm or api_key is None or not rows:
+        return det
 
     try:
-        prompt = _build_compare_prompt(rows)
+        prompt = (
+            "here is a computed statistical summary of a batch of cyclic "
+            "voltammetry results:\n\n"
+            f"overview: {det.overview}\n"
+            f"patterns: {det.patterns}\n"
+            f"outliers: {det.outliers}\n\n"
+            "rewrite the overview as one friendly, readable paragraph for a "
+            "lab notebook. do not add, change, or recompute any number, and "
+            "do not add or remove outliers. respond with valid json only, "
+            'no markdown: {"overview": "..."}'
+        )
         response = _call_claude(prompt, api_key)
+        overview = response.get("overview") or det.overview
         return AgentComparison(
-            overview=response.get("overview", ""),
-            patterns=list(response.get("patterns", [])),
-            outliers=list(response.get("outliers", [])),
-            recommendations=list(response.get("recommendations", [])),
+            overview=overview,
+            patterns=det.patterns,
+            outliers=det.outliers,
+            recommendations=det.recommendations,
         )
     except Exception as exc:
-        print(f"heads up, agent compare call failed ({exc}). falling back to rules.")
-        return _deterministic_compare(rows)
+        print(f"heads up, llm phrasing failed ({exc}). using the computed text.")
+        return det
