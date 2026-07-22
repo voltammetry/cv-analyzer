@@ -17,9 +17,8 @@ matplotlib.use("Agg")  # non interactive backend, safe to use in scripts
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .analysis import CdlResult, LavironResult, NicholsonResult, RandlesSevcikResult
+from .analysis import CdlResult, LavironResult, NicholsonResult, RandlesSevcikResult, PeakTable, ReplicateTable
 from .models import CVExperiment
-
 
 # -----------------------------------------------------------------------------
 # the plots
@@ -56,9 +55,14 @@ def plot_randles_sevcik(result: RandlesSevcikResult, out_path: Path) -> Path:
     """ip vs sqrt(nu) with the linear fit on top, for both anodic and cathodic peaks."""
     fig, ax = plt.subplots(figsize=(6, 4.5))
     x = result.sqrt_scan_rates
-    # scatter the data points
-    ax.scatter(x, np.abs(result.ipa_a) * 1e6, color="C3", label="|ipa| (anodic)", zorder=3)
-    ax.scatter(x, np.abs(result.ipc_a) * 1e6, color="C0", label="|ipc| (cathodic)", zorder=3)
+    # scatter the data points. when the result came from replicate-averaged
+    # data we also have a std dev per point, drawn as error bars per protocol.
+    yerr_a = result.ipa_std_a * 1e6 if result.ipa_std_a is not None else None
+    yerr_c = result.ipc_std_a * 1e6 if result.ipc_std_a is not None else None
+    ax.errorbar(x, np.abs(result.ipa_a) * 1e6, yerr=yerr_a, fmt="o",
+                color="C3", label="|ipa| (anodic)", zorder=3, capsize=3)
+    ax.errorbar(x, np.abs(result.ipc_a) * 1e6, yerr=yerr_c, fmt="o",
+                color="C0", label="|ipc| (cathodic)", zorder=3, capsize=3)
 
     # draw the fit lines from 0 out past the last point
     x_line = np.linspace(0, x.max() * 1.05, 100)
@@ -106,22 +110,41 @@ def plot_cdl(result: CdlResult, out_path: Path) -> Path:
 
 
 def plot_laviron(result: LavironResult, out_path: Path) -> Path:
-    """peak separation vs log scan rate. the diagnostic plot for laviron."""
+    """the protocol's laviron plot: averaged ΔEa and ΔEc vs ln(ν) with fits."""
     fig, ax = plt.subplots(figsize=(6, 4.5))
-    valid = ~np.isnan(result.delta_ep_v)
-    ax.scatter(result.log_scan_rates[valid],
-               result.delta_ep_v[valid] * 1000,
-               color="C4", zorder=3, label="ΔEp")
-    # 100 mV is the rough threshold where the kinetic regime starts
-    ax.axhline(100, color="k", lw=0.4, ls=":", alpha=0.5,
-               label="~100 mV: kinetic regime threshold")
-    ax.set_xlabel(r"$\log_{10}(\nu / \mathrm{V s^{-1}})$")
-    ax.set_ylabel(r"$\Delta E_p$ / mV")
+    x = result.ln_scan_rates
+    ea_err = (result.delta_ea_std_v * 1000 if result.delta_ea_std_v is not None else None)
+    ec_err = (result.delta_ec_std_v * 1000 if result.delta_ec_std_v is not None else None)
+    ax.errorbar(x, result.delta_ea_v * 1000, yerr=ea_err, fmt="o", color="C3",
+                capsize=3, zorder=3, label="ΔEa = Ep,a − E0'")
+    ax.errorbar(x, result.delta_ec_v * 1000, yerr=ec_err, fmt="o", color="C0",
+                capsize=3, zorder=3, label="ΔEc = Ep,c − E0'")
+
+    if result.anodic_branch_fit is not None and result.cathodic_branch_fit is not None:
+        # extend the fit lines to where they cross  delta E = 0 so the x-intercept
+        # (the critical scan rate Vc) is visible on the plot
+        x0s = [-f.intercept / f.slope
+               for f in (result.anodic_branch_fit, result.cathodic_branch_fit)
+               if f.slope != 0]
+        x_min = min([x.min(), *x0s]) - 0.3
+        x_line = np.linspace(x_min, x.max() + 0.3, 100)
+        fa, fc = result.anodic_branch_fit, result.cathodic_branch_fit
+        ax.plot(x_line, (fa.slope * x_line + fa.intercept) * 1000, color="C3",
+                lw=1.0, label=f"anodic fit (R²={fa.r_squared:.3f})")
+        ax.plot(x_line, (fc.slope * x_line + fc.intercept) * 1000, color="C0",
+                lw=1.0, ls="--", label=f"cathodic fit (R²={fc.r_squared:.3f})")
+        if result.vc_v_s is not None:
+            ax.axvline(np.log(result.vc_v_s), color="k", lw=0.6, ls=":",
+                       label=f"x-intercept → Vc = {result.vc_v_s:.3g} V/s")
+    ax.axhline(0, color="k", lw=0.4, alpha=0.4)
+
+    ax.set_xlabel(r"$\ln(\nu / \mathrm{V\,s^{-1}})$")
+    ax.set_ylabel(r"$\Delta E$ / mV")
     title = f"Laviron: {result.electrode_id}"
     if result.k0_per_s is not None:
-        title += f"  (k⁰ ≈ {result.k0_per_s:.2e} s⁻¹, α = {result.alpha:.2f})"
+        title += f"  (ks ≈ {result.k0_per_s:.2e} s⁻¹, α = {result.alpha:.2f})"
     else:
-        title += "  (k⁰ unresolved, see notes)"
+        title += "  (ks unresolved, see notes)"
     ax.set_title(title)
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8)
@@ -230,6 +253,27 @@ Slope → electrochemically active surface area via
 <table><tr><th>ν / mV·s⁻¹</th><th>ipa / µA</th><th>ipc / µA</th></tr>{rows}</table>
 """
 
+def _peak_table_section_html(table: PeakTable) -> str:
+    # the explicit per-scan-rate table the protocol requires (steps 16-18):
+    # both peaks, formal potential, and the ΔE columns.
+    rows = "".join(
+        f"<tr><td>{nu*1000:g}</td><td>{epa:.4f}</td><td>{ipa*1e6:.3f}</td>"
+        f"<td>{epc:.4f}</td><td>{ipc*1e6:.3f}</td><td>{e0:.4f}</td>"
+        f"<td>{dea*1000:.1f}</td><td>{dec*1000:.1f}</td><td>{dep*1000:.1f}</td></tr>"
+        for nu, epa, ipa, epc, ipc, e0, dea, dec, dep in zip(
+            table.scan_rates_v_s, table.ep_a_v, table.ip_a_a, table.ep_c_v,
+            table.ip_c_a, table.e0_prime_v, table.delta_ea_v,
+            table.delta_ec_v, table.delta_ep_v)
+    )
+    return f"""
+<h2>Peak table (protocol steps 16–18)</h2>
+<p>Second-cycle peaks per scan rate, the formal potential
+E⁰′ = (Ep,a + Ep,c)/2, and ΔEa/ΔEc = Ep − E⁰′.</p>
+<table><tr><th>ν / mV·s⁻¹</th><th>Ep,a / V</th><th>ipa / µA</th>
+<th>Ep,c / V</th><th>ipc / µA</th><th>E⁰′ / V</th>
+<th>ΔEa / mV</th><th>ΔEc / mV</th><th>ΔEp / mV</th></tr>{rows}</table>
+"""
+
 
 def _cdl_section_html(cdl_res: CdlResult, cdl_plot: Path) -> str:
     # cdl section. plot, the capacitance and r squared, then a table of i at
@@ -250,22 +294,25 @@ For purely capacitive behavior, <em>i = C_dl · ν</em>, so the slope is C_dl.</
 
 
 def _laviron_section_html(lav: LavironResult, lav_plot: Path) -> str:
-    # laviron section, including the caveat note at the bottom about when
-    # k0 is reliable.
+    # laviron section per the protocol: ln(ν) fit, x-intercept, ks = nFαVc/RT
     if lav.k0_per_s is None:
-        k0_str = "(unresolved)"
-        alpha_str = "(unresolved)" if lav.alpha is None else f"{lav.alpha:.3f}"
+        ks_str = "(unresolved)"
+        vc_str = "(unresolved)"
     else:
-        k0_str = f"{lav.k0_per_s:.3e} s⁻¹"
-        alpha_str = f"{lav.alpha:.3f}"
+        ks_str = f"{lav.k0_per_s:.3e} s⁻¹"
+        vc_str = f"{lav.vc_v_s:.3g} V/s"
+    alpha_str = ("(unresolved)" if lav.alpha is None
+                 else f"{lav.alpha:.3f} ({lav.alpha_source})")
     return f"""
 <h2>3 · Laviron (Electron Transfer Kinetics)</h2>
-<p>Peak separation ΔEp = Ep,a − Ep,c plotted against log(ν). In the kinetic
-regime (ΔEp ≳ 100 mV at 25 °C, n=1), the anodic and cathodic branches go
-linear with log(ν) and yield the transfer coefficient α and k⁰.</p>
+<p>Replicate-averaged ΔEa and ΔEc (n = {lav.n_replicates}) plotted against
+ln(ν) and fit linearly. The x-intercept (ΔE → 0) gives the critical scan
+rate Vc, and <em>ks = n·F·α·Vc / (R·T)</em> per protocol step 25. Applies
+when the mean peak separation exceeds 212 mV.</p>
 <img src="{lav_plot.name}" alt="Laviron plot">
-<p><b>α</b> = {alpha_str} &nbsp;&nbsp;<b>k⁰</b> = {k0_str}</p>
-<div class="note"><b>Caveat:</b> {lav.notes}</div>
+<p><b>α</b> = {alpha_str} &nbsp;&nbsp;<b>Vc</b> = {vc_str} &nbsp;&nbsp;
+<b>ks</b> = {ks_str}</p>
+<div class="note"><b>Notes:</b> {lav.notes}</div>
 """
 
 def _nicholson_section_html(nic: NicholsonResult, nic_plot: Path) -> str:
@@ -299,6 +346,7 @@ def write_electrode_report(
     nic: NicholsonResult | None,
     nic_plot: Path | None,
     out_path: Path,
+    peaks: PeakTable | None = None,
 ) -> Path:
     """stitch the plots and analysis results into one html page for one electrode."""
     summary = _summary_block(rs, cdl_res, lav)
@@ -306,6 +354,9 @@ def write_electrode_report(
     sections: list[str] = [
         f'<h2>0 · Raw CV traces</h2><img src="{cv_plot.name}" alt="CV overlay">'
     ]
+    # the protocol's per-scan-rate peak table comes right after the raw data
+    if peaks is not None:                           
+        sections.append(_peak_table_section_html(peaks))
     # then each analysis section, if we have it
     if rs is not None and rs_plot is not None:
         sections.append(_rs_section_html(rs, rs_plot))
@@ -321,5 +372,67 @@ def write_electrode_report(
         summary_html=summary,
         sections_html="\n".join(sections),
     )
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+def write_group_report(
+    group_id: str,
+    rep,  # ReplicateTable
+    rs: RandlesSevcikResult | None,
+    rs_plot: Path | None,
+    lav: LavironResult | None,
+    lav_plot: Path | None,
+    nic: NicholsonResult | None,
+    nic_plot: Path | None,
+    method: str,
+    out_path: Path,
+) -> Path:
+    """the replicate-group report: averaged data, the protocol's real output.
+
+    shows the averaged peak table (mean ± std across the replicate
+    electrodes), the randles sevcik fit on averaged currents, and whichever
+    kinetics method the peak-separation rule selected.
+    """
+    summary = _summary_block(rs, None, lav)
+    if nic is not None and nic.ks_mean_cm_s is not None:
+        summary += (
+            f'<div class="metric"><div class="v">{nic.ks_mean_cm_s:.2e} cm/s</div>'
+            f'<div class="l">ks (Nicholson)</div></div>'
+        )
+
+    avg_rows = "".join(
+        f"<tr><td>{nu*1000:g}</td>"
+        f"<td>{ia*1e6:.2f} ± {sa*1e6:.2f}</td>"
+        f"<td>{ic*1e6:.2f} ± {sc*1e6:.2f}</td>"
+        f"<td>{dep*1000:.1f} ± {sdep*1000:.1f}</td></tr>"
+        for nu, ia, sa, ic, sc, dep, sdep in zip(
+            rep.scan_rates_v_s,
+            rep.ip_a_mean_a, rep.ip_a_std_a,
+            rep.ip_c_mean_a, rep.ip_c_std_a,
+            rep.delta_ep_mean_v, rep.delta_ep_std_v)
+    )
+    sections: list[str] = [f"""
+<h2>Replicate-averaged data (protocol steps 19–20)</h2>
+<p>Mean ± std dev across electrodes: {", ".join(rep.electrode_ids)}.
+Mean peak separation ΔEp = {rep.mean_delta_ep_mv:.0f} mV → kinetics
+method selected by the protocol rule: <b>{method}</b>.</p>
+<table><tr><th>ν / mV·s⁻¹</th><th>ipa / µA</th><th>ipc / µA</th>
+<th>ΔEp / mV</th></tr>{avg_rows}</table>
+"""]
+    if rs is not None and rs_plot is not None:
+        sections.append(_rs_section_html(rs, rs_plot))
+    if lav is not None and lav_plot is not None:
+        sections.append(_laviron_section_html(lav, lav_plot))
+    if nic is not None and nic_plot is not None:
+        sections.append(_nicholson_section_html(nic, nic_plot))
+
+    html = _HTML_TEMPLATE.format(
+        electrode_id=f"Replicate group {group_id}",
+        summary_html=summary,
+        sections_html="\n".join(sections),
+    )
+    # the shared template's h1 says "Electrode {id}"; fix the prefix for groups
+    html = html.replace("<h1>Electrode Replicate group", "<h1>Replicate group")
+    html = html.replace("<title>Replicate group", "<title>Group")
     out_path.write_text(html, encoding="utf-8")
     return out_path
