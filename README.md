@@ -156,7 +156,7 @@ and an individual Randles-Sevcik/Cdl fit — but kinetics (Laviron/Nicholson)
 and the EASA you should actually report run on the replicate-averaged data,
 in `group_<group_id>_report.html`.
 
-## File naming convention (optional convenience, not required)
+## File naming convention
 
 ```
 cv_sp<size>_<electrode_id>_<scan_rate>mvs_<MMDDYY>_<batch_code>[_ff].csv
