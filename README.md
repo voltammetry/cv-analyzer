@@ -27,7 +27,7 @@ by a language model.
 ## Installation
 
 ```bash
-git clone https://github.com/<you>/cv-agent.git
+git clone https://github.com/voltammetry/cv-agent.git
 cd cv-agent
 python -m venv .venv
 source .venv/bin/activate      # <-- macos. windows: .venv\Scripts\Activate.ps1
